@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bleft client</title>
+<link rel="icon" href="data:,">
+<style>
+  body { font: 15px system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
+  fieldset { margin: 1rem 0; }
+  label { display: block; margin: .4rem 0; }
+  button { padding: .4rem .9rem; }
+  progress { width: 100%; }
+  #log { background: #111; color: #ddd; padding: .6rem; height: 12rem; overflow: auto; font: 12px ui-monospace, monospace; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>bleft client</h1>
+<p>Streams data over Bluetooth LE to <code>bleft-listener</code>, which saves each stream to a timestamped file.</p>
+
+<fieldset>
+  <legend>1. Connection</legend>
+  <button id="connect">Connect…</button>
+  <button id="disconnect" disabled>Disconnect</button>
+  <span id="status">not connected</span>
+</fieldset>
+
+<fieldset>
+  <legend>Options</legend>
+  <label>Chunk size (bytes per write) <input id="chunk" type="number" min="1" max="500" value="128"></label>
+  <label><input id="noresp" type="checkbox"> Write without response (faster, unacknowledged; the CRC check catches loss)</label>
+</fieldset>
+
+<fieldset>
+  <legend>2. Send</legend>
+  <label>File: <input id="file" type="file"> <button id="sendFile" disabled>Send file</button></label>
+  <label>Text: <input id="text" size="40" value="hello from the browser"> <button id="sendText" disabled>Send text</button></label>
+  <label>Generated test stream: <input id="testKb" type="number" min="1" value="64" style="width:5em"> KiB
+    <button id="sendTest" disabled>Send test data</button></label>
+  <button id="cancel" disabled>Cancel</button>
+  <progress id="progress" value="0" max="1"></progress>
+</fieldset>
+
+<div id="log"></div>
+
+<script type="module">
+import { BleftClient } from './bleft.js';
+
+const $ = (id) => document.getElementById(id);
+const client = new BleftClient();
+let abort = null;
+
+const log = (msg) => {
+  const el = $('log');
+  el.textContent += `${new Date().toLocaleTimeString()}  ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+};
+
+function refresh() {
+  const c = client.connected, busy = !!abort;
+  $('connect').disabled = c;
+  $('disconnect').disabled = !c;
+  for (const id of ['sendFile', 'sendText', 'sendTest']) $(id).disabled = !c || busy;
+  $('cancel').disabled = !busy;
+  $('status').textContent = c ? `connected to ${client.deviceName}` : 'not connected';
+}
+
+client.addEventListener('connected', refresh);
+client.addEventListener('disconnected', () => { log('disconnected'); refresh(); });
+
+$('connect').onclick = async () => {
+  try { await client.connect(); log(`connected to ${client.deviceName}`); }
+  catch (e) { log(`connect failed: ${e.message}`); }
+  refresh();
+};
+$('disconnect').onclick = () => client.disconnect();
+$('cancel').onclick = () => abort?.abort();
+
+async function run(label, name, makeSource, total) {
+  abort = new AbortController();
+  refresh();
+  $('progress').max = total || 1;
+  $('progress').value = 0;
+  const t0 = performance.now();
+  log(`sending ${label}…`);
+  try {
+    const { bytes, crc32 } = await client.sendStream(makeSource(), {
+      name,
+      chunkSize: Math.max(1, Math.min(500, +$('chunk').value || 128)),
+      withResponse: !$('noresp').checked,
+      signal: abort.signal,
+      onProgress: (n) => { $('progress').value = n; },
+    });
+    const s = (performance.now() - t0) / 1000;
+    log(`done: ${bytes} bytes in ${s.toFixed(1)}s (${(bytes / 1024 / s).toFixed(1)} KiB/s), crc32 ${crc32.toString(16).padStart(8, '0')}`);
+  } catch (e) {
+    log(`failed: ${e.name === 'AbortError' ? 'cancelled' : e.message}`);
+  } finally {
+    abort = null;
+    refresh();
+  }
+}
+
+$('sendFile').onclick = () => {
+  const f = $('file').files[0];
+  if (!f) return log('choose a file first');
+  run(`file ${f.name}`, f.name, () => f.stream(), f.size);
+};
+
+$('sendText').onclick = () => {
+  const bytes = new TextEncoder().encode($('text').value);
+  run('text', 'text.txt', () => [bytes], bytes.length);
+};
+
+$('sendTest').onclick = () => {
+  const total = Math.max(1, +$('testKb').value || 1) * 1024;
+  // Deterministic, non-repeating-looking pattern so corruption is easy to spot on the listener side.
+  async function* gen() {
+    let sent = 0;
+    while (sent < total) {
+      const n = Math.min(4096, total - sent);
+      const b = new Uint8Array(n);
+      for (let i = 0; i < n; i++) b[i] = ((sent + i) * 31 + ((sent + i) >> 8)) & 0xff;
+      sent += n;
+      yield b;
+    }
+  }
+  run(`${total} test bytes`, 'test.bin', gen, total);
+};
+
+if (!navigator.bluetooth) log('Web Bluetooth unavailable: use Chrome or Edge, served from https or http://localhost');
+refresh();
+</script>
+</body>
+</html>
