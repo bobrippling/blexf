@@ -14,8 +14,16 @@
   progress { width: 100%; }
   #xferStatus { font: 12px ui-monospace, monospace; color: #555; }
   #log { background: #111; color: #ddd; padding: .6rem; height: 12rem; overflow: auto; font: 12px ui-monospace, monospace; white-space: pre-wrap; }
-  #term { background: #000; padding: .4rem; }
-  #term .xterm { height: 20rem; }
+  #ttyHint { font-size: 12px; color: #555; margin: .3rem 0; }
+  #term {
+    background: #000; padding: .4rem; box-sizing: border-box;
+    height: 20rem; min-height: 8rem; min-width: 16rem; max-width: 100%;
+    resize: both; overflow: hidden; /* gives the browser's native drag-to-resize handle */
+  }
+  #term .xterm { height: 100%; width: 100%; }
+  /* Fullscreen is normally sized to fill the viewport by the browser regardless
+     of these rules; this just keeps things sane if that ever isn't the case. */
+  #term:fullscreen { width: 100vw; height: 100vh; }
 </style>
 </head>
 <body>
@@ -50,7 +58,13 @@
   <legend>3. Remote shell (TTY)</legend>
   <button id="ttyStart" disabled>Open shell</button>
   <button id="ttyStop" disabled>Close shell</button>
+  <button id="ttyFullscreen">Fullscreen</button>
   <span id="ttyStatus">not open</span>
+  <div id="ttyHint">
+    Drag the terminal's bottom-right corner to resize it.
+    Browser shortcuts like Ctrl-W normally reach the browser, not the terminal;
+    use Fullscreen to let the terminal capture them instead (Chrome/Edge only).
+  </div>
   <div id="term"></div>
 </fieldset>
 
@@ -97,10 +111,55 @@ const fit = new FitAddon();
 term.loadAddon(fit);
 term.open($('term'));
 fit.fit();
-window.addEventListener('resize', () => fit.fit());
+
+// Refit whenever #term's own size changes: a window resize, but also the
+// user dragging the resize handle in its bottom-right corner (CSS `resize`),
+// which does *not* fire a window 'resize' event.
+new ResizeObserver(() => fit.fit()).observe($('term'));
 
 term.onData((data) => client.ttyWrite(new TextEncoder().encode(data)).catch((e) => log(`tty write failed: ${e.message}`)));
 term.onResize(({ cols, rows }) => client.ttyResize(cols, rows).catch(() => {}));
+
+// Browsers reserve some Ctrl/Cmd shortcuts (Ctrl-W etc.) that no page can
+// preventDefault() outside of Fullscreen + Keyboard Lock (see below); for
+// everything else, try to stop the browser from acting on it and send it to
+// the shell instead.
+const RESERVED_CODES = new Set(['KeyW', 'KeyT', 'KeyN', 'KeyQ', 'KeyR', 'KeyP', 'KeyL', 'KeyD', 'F5', 'F11']);
+term.attachCustomKeyEventHandler((e) => {
+  if ((e.ctrlKey || e.metaKey) && RESERVED_CODES.has(e.code)) e.preventDefault();
+  return true; // still let xterm turn it into terminal input
+});
+
+// Fullscreen + Keyboard Lock (Chrome/Edge): the only standard way for a page
+// to actually capture shortcuts like Ctrl-W instead of the browser.
+let keyboardLocked = false;
+async function setTtyFullscreen(on) {
+  if (on) {
+    if (!$('term').requestFullscreen) { log('Fullscreen is not supported in this browser'); return; }
+    await $('term').requestFullscreen().catch((e) => log(`fullscreen failed: ${e.message}`));
+  } else if (document.fullscreenElement) {
+    await document.exitFullscreen().catch(() => {});
+  }
+}
+document.addEventListener('fullscreenchange', async () => {
+  const active = document.fullscreenElement === $('term');
+  $('ttyFullscreen').textContent = active ? 'Exit fullscreen' : 'Fullscreen';
+  if (active && navigator.keyboard?.lock) {
+    try {
+      await navigator.keyboard.lock();
+      keyboardLocked = true;
+      log('keyboard lock on: this tab should now receive Ctrl-W and friends');
+    } catch (e) {
+      log(`keyboard lock failed: ${e.message}`);
+    }
+  } else if (!active && keyboardLocked) {
+    navigator.keyboard.unlock?.();
+    keyboardLocked = false;
+  }
+  fit.fit();
+  if (active) term.focus();
+});
+$('ttyFullscreen').onclick = () => setTtyFullscreen(!document.fullscreenElement);
 
 client.addEventListener('tty-data', (e) => term.write(e.data));
 client.addEventListener('tty-exit', (e) => { term.writeln(`\r\n[shell exited, code ${e.code}]`); refresh(); });
