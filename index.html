@@ -56,11 +56,13 @@
 
 <fieldset>
   <legend>3. Remote shell (TTY)</legend>
+  <label style="display:inline-block">Password: <input id="ttyPassword" type="password" size="12" autocomplete="off"></label>
   <button id="ttyStart" disabled>Open shell</button>
   <button id="ttyStop" disabled>Close shell</button>
   <button id="ttyFullscreen">Fullscreen</button>
   <span id="ttyStatus">not open</span>
   <div id="ttyHint">
+    Password is whatever the listener printed at startup (or your <code>--tty-password</code>).
     Drag the terminal's bottom-right corner to resize it.
     Browser shortcuts like Ctrl-W normally reach the browser, not the terminal;
     use Fullscreen to let the terminal capture them instead (Chrome/Edge only).
@@ -167,12 +169,16 @@ client.addEventListener('tty-exit', (e) => { term.writeln(`\r\n[shell exited, co
 $('ttyStart').onclick = async () => {
   try {
     term.reset();
-    await client.ttyStart();
+    term.writeln('connecting...');
+    await client.ttyStart($('ttyPassword').value);
+    term.reset();
     fit.fit();
     await client.ttyResize(term.cols, term.rows);
     term.focus();
   } catch (e) {
+    term.reset();
     log(`tty start failed: ${e.message}`);
+    term.writeln(`[${e.message}]`);
   }
   refresh();
 };

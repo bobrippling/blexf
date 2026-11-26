@@ -8,13 +8,19 @@
 //   0x02 DATA  [payload]              append payload
 //   0x03 END   [u32le length][u32le crc32]
 //
-// TTY: a login shell on the listener, driven like a remote terminal.
+// TTY: a login shell on the listener, driven like a remote terminal, gated by
+// a password since it's sensitive (plain bytes over an unencrypted GATT
+// write - stops casual access, not a determined attacker who can sniff the
+// link). Subscribing alone does not start a shell; it opens an auth window.
 //   TTY_RX_CHAR_UUID (write, browser -> listener):
 //     0x01 DATA   [bytes]                      keystrokes/input
 //     0x02 RESIZE [u16le cols][u16le rows]
+//     0x03 AUTH   [utf8 password]
 //   TTY_TX_CHAR_UUID (notify, listener -> browser):
-//     0x01 DATA [bytes]                        shell output
-//     0x03 EXIT [i32le code]                   shell exited; session is over
+//     0x01 DATA      [bytes]                   shell output
+//     0x02 AUTH_OK                             password accepted, shell starting
+//     0x03 EXIT      [i32le code]               shell exited; session is over
+//     0x04 AUTH_FAIL                           wrong password; send another AUTH to retry
 
 export const SERVICE_UUID = 'bf1e0001-7c5a-4b8e-9d3f-2a6c1e0b5d70';
 export const DATA_CHAR_UUID = 'bf1e0002-7c5a-4b8e-9d3f-2a6c1e0b5d70';
@@ -27,7 +33,11 @@ const PKT_END = 0x03;
 
 const TTY_PKT_DATA = 0x01;
 const TTY_PKT_RESIZE = 0x02;
-const TTY_PKT_EXIT = 0x03;
+const TTY_RX_PKT_AUTH = 0x03; // rx only
+const TTY_TX_PKT_AUTH_OK = 0x02; // tx only
+const TTY_PKT_EXIT = 0x03; // tx only
+const TTY_TX_PKT_AUTH_FAIL = 0x04; // tx only
+const TTY_AUTH_TIMEOUT_MS = 8000;
 
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);
@@ -105,6 +115,7 @@ export class BleftClient extends EventTarget {
   #ttyRx = null;
   #ttyTx = null;
   #ttyActive = false;
+  #pendingAuth = null; // { resolve, reject } while an AUTH is in flight
 
   get connected() {
     return !!this.#device?.gatt?.connected && !!this.#char;
@@ -128,6 +139,8 @@ export class BleftClient extends EventTarget {
       this.#ttyRx = null;
       this.#ttyTx = null;
       this.#ttyActive = false;
+      this.#pendingAuth?.reject(new Error('disconnected'));
+      this.#pendingAuth = null;
       this.dispatchEvent(new Event('disconnected'));
     });
     const server = await device.gatt.connect();
@@ -147,28 +160,56 @@ export class BleftClient extends EventTarget {
     this.#device?.gatt?.disconnect();
   }
 
-  /** Subscribe to the TTY output characteristic; the listener starts its shell. */
-  async ttyStart() {
+  /**
+   * Subscribe to the TTY output characteristic and authenticate; the listener
+   * starts its shell once the password is accepted. Resolves once the shell
+   * has started; rejects (without ever touching the shell) if the password
+   * is wrong, or the listener doesn't answer within a few seconds.
+   *
+   * @param {string} [password] - must match the listener's `--tty-password`
+   *   (or whatever it printed at startup); leave empty if it was started
+   *   with `--tty-no-password`.
+   */
+  async ttyStart(password = '') {
     if (!this.#ttyTx || !this.#ttyRx) throw new Error('listener has no TTY support');
     this.#ttyTx.addEventListener('characteristicvaluechanged', this.#onTtyNotify);
-    // The listener starts/stops its one shared shell on GATT subscribe/unsubscribe
-    // (see protocol docs). If the shell already exited while we stayed subscribed
-    // (we only unsubscribe when the user clicks "close"), startNotifications() on
-    // an already-active subscription is a no-op in Web Bluetooth - no new
-    // "subscribed" event would reach the listener, so no new shell would start.
-    // Force a clean unsubscribe/resubscribe cycle so one always does.
+    // The listener opens a fresh auth window on GATT subscribe (see protocol
+    // docs); it doesn't start a shell until a correct AUTH follows. If we
+    // stayed subscribed after the shell last exited (we only unsubscribe when
+    // the user clicks "close"), startNotifications() on an already-active
+    // subscription is a no-op in Web Bluetooth - no new "subscribed" event
+    // would reach the listener. Force a clean unsubscribe/resubscribe cycle
+    // so one always does.
     try {
       await this.#ttyTx.stopNotifications();
     } catch {
       // wasn't subscribed; nothing to undo.
     }
     await this.#ttyTx.startNotifications();
-    this.#ttyActive = true;
+
+    const authed = new Promise((resolve, reject) => {
+      this.#pendingAuth = { resolve, reject };
+    });
+    const timeout = setTimeout(
+      () => this.#pendingAuth?.reject(new Error("listener didn't respond to the password (old listener without TTY auth?)")),
+      TTY_AUTH_TIMEOUT_MS,
+    );
+    try {
+      const pwBytes = new TextEncoder().encode(password).subarray(0, 200);
+      await (this.#ttyRx.writeValueWithResponse ?? this.#ttyRx.writeValue).call(this.#ttyRx, packet(TTY_RX_PKT_AUTH, pwBytes));
+      await authed;
+      this.#ttyActive = true;
+    } finally {
+      clearTimeout(timeout);
+      this.#pendingAuth = null;
+    }
   }
 
   /** Unsubscribe; the listener stops the shared shell once nobody is listening. */
   async ttyStop() {
     this.#ttyActive = false;
+    this.#pendingAuth?.reject(new Error('closed'));
+    this.#pendingAuth = null;
     if (!this.#ttyTx) return;
     this.#ttyTx.removeEventListener('characteristicvaluechanged', this.#onTtyNotify);
     try {
@@ -187,6 +228,10 @@ export class BleftClient extends EventTarget {
     } else if (kind === TTY_PKT_EXIT && value.byteLength >= 5) {
       this.#ttyActive = false;
       this.dispatchEvent(new TtyExitEvent(value.getInt32(1, true)));
+    } else if (kind === TTY_TX_PKT_AUTH_OK) {
+      this.#pendingAuth?.resolve();
+    } else if (kind === TTY_TX_PKT_AUTH_FAIL) {
+      this.#pendingAuth?.reject(new Error('wrong password'));
     }
   };
 
