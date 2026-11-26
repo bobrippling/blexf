@@ -151,6 +151,17 @@ export class BleftClient extends EventTarget {
   async ttyStart() {
     if (!this.#ttyTx || !this.#ttyRx) throw new Error('listener has no TTY support');
     this.#ttyTx.addEventListener('characteristicvaluechanged', this.#onTtyNotify);
+    // The listener starts/stops its one shared shell on GATT subscribe/unsubscribe
+    // (see protocol docs). If the shell already exited while we stayed subscribed
+    // (we only unsubscribe when the user clicks "close"), startNotifications() on
+    // an already-active subscription is a no-op in Web Bluetooth - no new
+    // "subscribed" event would reach the listener, so no new shell would start.
+    // Force a clean unsubscribe/resubscribe cycle so one always does.
+    try {
+      await this.#ttyTx.stopNotifications();
+    } catch {
+      // wasn't subscribed; nothing to undo.
+    }
     await this.#ttyTx.startNotifications();
     this.#ttyActive = true;
   }
