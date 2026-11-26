@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>bleft client</title>
 <link rel="icon" href="data:,">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
 <style>
   body { font: 15px system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
   fieldset { margin: 1rem 0; }
@@ -13,11 +14,13 @@
   progress { width: 100%; }
   #xferStatus { font: 12px ui-monospace, monospace; color: #555; }
   #log { background: #111; color: #ddd; padding: .6rem; height: 12rem; overflow: auto; font: 12px ui-monospace, monospace; white-space: pre-wrap; }
+  #term { background: #000; padding: .4rem; }
+  #term .xterm { height: 20rem; }
 </style>
 </head>
 <body>
 <h1>bleft client</h1>
-<p>Streams data over Bluetooth LE to <code>bleft-listener</code>, which saves each stream to a timestamped file.</p>
+<p>Streams data over Bluetooth LE to <code>bleft-listener</code>, which saves each stream to a timestamped file, and can drive its remote shell (TTY) like a terminal.</p>
 
 <fieldset>
   <legend>1. Connection</legend>
@@ -43,10 +46,24 @@
   <div id="xferStatus"></div>
 </fieldset>
 
+<fieldset>
+  <legend>3. Remote shell (TTY)</legend>
+  <button id="ttyStart" disabled>Open shell</button>
+  <button id="ttyStop" disabled>Close shell</button>
+  <span id="ttyStatus">not open</span>
+  <div id="term"></div>
+</fieldset>
+
 <div id="log"></div>
 
+<script type="importmap">
+  { "imports": { "@xterm/xterm": "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/+esm",
+                 "@xterm/addon-fit": "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/+esm" } }
+</script>
 <script type="module">
 import { BleftClient } from './bleft.js';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
 
 const $ = (id) => document.getElementById(id);
 const client = new BleftClient();
@@ -59,16 +76,51 @@ const log = (msg) => {
 };
 
 function refresh() {
-  const c = client.connected, busy = !!abort;
+  const c = client.connected, busy = !!abort, tty = client.ttyConnected;
   $('connect').disabled = c;
   $('disconnect').disabled = !c;
   for (const id of ['sendFile', 'sendText', 'sendTest']) $(id).disabled = !c || busy;
   $('cancel').disabled = !busy;
   $('status').textContent = c ? `connected to ${client.deviceName}` : 'not connected';
+  $('ttyStart').disabled = !c || tty;
+  $('ttyStop').disabled = !tty;
+  $('ttyStatus').textContent = tty ? 'open' : 'not open';
 }
 
 client.addEventListener('connected', refresh);
-client.addEventListener('disconnected', () => { log('disconnected'); refresh(); });
+client.addEventListener('disconnected', () => { log('disconnected'); term.writeln('\r\n[disconnected]'); refresh(); });
+
+// --- Remote shell (TTY) ---------------------------------------------------
+
+const term = new Terminal({ convertEol: true, fontSize: 13, scrollback: 2000 });
+const fit = new FitAddon();
+term.loadAddon(fit);
+term.open($('term'));
+fit.fit();
+window.addEventListener('resize', () => fit.fit());
+
+term.onData((data) => client.ttyWrite(new TextEncoder().encode(data)).catch((e) => log(`tty write failed: ${e.message}`)));
+term.onResize(({ cols, rows }) => client.ttyResize(cols, rows).catch(() => {}));
+
+client.addEventListener('tty-data', (e) => term.write(e.data));
+client.addEventListener('tty-exit', (e) => { term.writeln(`\r\n[shell exited, code ${e.code}]`); refresh(); });
+
+$('ttyStart').onclick = async () => {
+  try {
+    term.reset();
+    await client.ttyStart();
+    fit.fit();
+    await client.ttyResize(term.cols, term.rows);
+    term.focus();
+  } catch (e) {
+    log(`tty start failed: ${e.message}`);
+  }
+  refresh();
+};
+$('ttyStop').onclick = async () => {
+  await client.ttyStop();
+  refresh();
+};
 
 $('connect').onclick = async () => {
   try { await client.connect(); log(`connected to ${client.deviceName}`); }

@@ -1,16 +1,33 @@
-// bleft client: stream data to a bleft-listener over Web Bluetooth.
+// bleft client: stream data to a bleft-listener over Web Bluetooth, and drive
+// its TTY (remote shell) session.
 //
-// Wire protocol (must match listener/src/protocol.rs). Each GATT write is a packet:
+// Wire protocol (must match listener/src/protocol.rs).
+//
+// File transfer: each GATT write to DATA_CHAR_UUID is a packet:
 //   0x01 START [utf8 name]            begin a new stream / file on the listener
 //   0x02 DATA  [payload]              append payload
 //   0x03 END   [u32le length][u32le crc32]
+//
+// TTY: a login shell on the listener, driven like a remote terminal.
+//   TTY_RX_CHAR_UUID (write, browser -> listener):
+//     0x01 DATA   [bytes]                      keystrokes/input
+//     0x02 RESIZE [u16le cols][u16le rows]
+//   TTY_TX_CHAR_UUID (notify, listener -> browser):
+//     0x01 DATA [bytes]                        shell output
+//     0x03 EXIT [i32le code]                   shell exited; session is over
 
 export const SERVICE_UUID = 'bf1e0001-7c5a-4b8e-9d3f-2a6c1e0b5d70';
 export const DATA_CHAR_UUID = 'bf1e0002-7c5a-4b8e-9d3f-2a6c1e0b5d70';
+export const TTY_RX_CHAR_UUID = 'bf1e0003-7c5a-4b8e-9d3f-2a6c1e0b5d70';
+export const TTY_TX_CHAR_UUID = 'bf1e0004-7c5a-4b8e-9d3f-2a6c1e0b5d70';
 
 const PKT_START = 0x01;
 const PKT_DATA = 0x02;
 const PKT_END = 0x03;
+
+const TTY_PKT_DATA = 0x01;
+const TTY_PKT_RESIZE = 0x02;
+const TTY_PKT_EXIT = 0x03;
 
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);
@@ -66,12 +83,36 @@ function concat(a, b) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Dispatched with `detail` a Uint8Array of shell output. */
+export class TtyDataEvent extends Event {
+  constructor(data) {
+    super('tty-data');
+    this.data = data;
+  }
+}
+
+/** Dispatched with `code` the shell's exit status; the session is over. */
+export class TtyExitEvent extends Event {
+  constructor(code) {
+    super('tty-exit');
+    this.code = code;
+  }
+}
+
 export class BleftClient extends EventTarget {
   #device = null;
   #char = null;
+  #ttyRx = null;
+  #ttyTx = null;
+  #ttyActive = false;
 
   get connected() {
     return !!this.#device?.gatt?.connected && !!this.#char;
+  }
+
+  /** Whether the TTY (remote shell) characteristics were found and notifications started. */
+  get ttyConnected() {
+    return this.connected && this.#ttyActive;
   }
 
   get deviceName() {
@@ -84,17 +125,74 @@ export class BleftClient extends EventTarget {
     const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE_UUID] }] });
     device.addEventListener('gattserverdisconnected', () => {
       this.#char = null;
+      this.#ttyRx = null;
+      this.#ttyTx = null;
+      this.#ttyActive = false;
       this.dispatchEvent(new Event('disconnected'));
     });
     const server = await device.gatt.connect();
     const service = await server.getPrimaryService(SERVICE_UUID);
     this.#char = await service.getCharacteristic(DATA_CHAR_UUID);
+    try {
+      this.#ttyRx = await service.getCharacteristic(TTY_RX_CHAR_UUID);
+      this.#ttyTx = await service.getCharacteristic(TTY_TX_CHAR_UUID);
+    } catch {
+      this.#ttyRx = this.#ttyTx = null; // listener without TTY support
+    }
     this.#device = device;
     this.dispatchEvent(new Event('connected'));
   }
 
   disconnect() {
     this.#device?.gatt?.disconnect();
+  }
+
+  /** Subscribe to the TTY output characteristic; the listener starts its shell. */
+  async ttyStart() {
+    if (!this.#ttyTx || !this.#ttyRx) throw new Error('listener has no TTY support');
+    this.#ttyTx.addEventListener('characteristicvaluechanged', this.#onTtyNotify);
+    await this.#ttyTx.startNotifications();
+    this.#ttyActive = true;
+  }
+
+  /** Unsubscribe; the listener stops the shared shell once nobody is listening. */
+  async ttyStop() {
+    this.#ttyActive = false;
+    if (!this.#ttyTx) return;
+    this.#ttyTx.removeEventListener('characteristicvaluechanged', this.#onTtyNotify);
+    try {
+      await this.#ttyTx.stopNotifications();
+    } catch {
+      // already gone (e.g. device disconnected); nothing to clean up.
+    }
+  }
+
+  #onTtyNotify = (ev) => {
+    const value = ev.target.value; // DataView
+    if (value.byteLength === 0) return;
+    const kind = value.getUint8(0);
+    if (kind === TTY_PKT_DATA) {
+      this.dispatchEvent(new TtyDataEvent(new Uint8Array(value.buffer, value.byteOffset + 1, value.byteLength - 1)));
+    } else if (kind === TTY_PKT_EXIT && value.byteLength >= 5) {
+      this.#ttyActive = false;
+      this.dispatchEvent(new TtyExitEvent(value.getInt32(1, true)));
+    }
+  };
+
+  /** Send keystrokes/input to the shell. */
+  async ttyWrite(bytes) {
+    if (!this.#ttyRx) throw new Error('listener has no TTY support');
+    const pkt = packet(TTY_PKT_DATA, bytes);
+    await (this.#ttyRx.writeValueWithoutResponse ?? this.#ttyRx.writeValue).call(this.#ttyRx, pkt);
+  }
+
+  /** Tell the shell the terminal was resized. */
+  async ttyResize(cols, rows) {
+    if (!this.#ttyRx) throw new Error('listener has no TTY support');
+    const body = new Uint8Array(4);
+    new DataView(body.buffer).setUint16(0, cols, true);
+    new DataView(body.buffer).setUint16(2, rows, true);
+    await (this.#ttyRx.writeValueWithoutResponse ?? this.#ttyRx.writeValue).call(this.#ttyRx, packet(TTY_PKT_RESIZE, body));
   }
 
   /**
