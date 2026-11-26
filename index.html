@@ -11,6 +11,7 @@
   label { display: block; margin: .4rem 0; }
   button { padding: .4rem .9rem; }
   progress { width: 100%; }
+  #xferStatus { font: 12px ui-monospace, monospace; color: #555; }
   #log { background: #111; color: #ddd; padding: .6rem; height: 12rem; overflow: auto; font: 12px ui-monospace, monospace; white-space: pre-wrap; }
 </style>
 </head>
@@ -39,6 +40,7 @@
     <button id="sendTest" disabled>Send test data</button></label>
   <button id="cancel" disabled>Cancel</button>
   <progress id="progress" value="0" max="1"></progress>
+  <div id="xferStatus"></div>
 </fieldset>
 
 <div id="log"></div>
@@ -76,24 +78,57 @@ $('connect').onclick = async () => {
 $('disconnect').onclick = () => client.disconnect();
 $('cancel').onclick = () => abort?.abort();
 
+function formatBytes(n) {
+  return n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MiB` : `${(n / 1024).toFixed(1)} KiB`;
+}
+
+function formatDuration(totalSeconds) {
+  const s = Math.max(0, Math.round(totalSeconds));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+}
+
 async function run(label, name, makeSource, total) {
   abort = new AbortController();
   refresh();
   $('progress').max = total || 1;
   $('progress').value = 0;
+  const status = $('xferStatus');
+  status.textContent = '';
   const t0 = performance.now();
   log(`sending ${label}…`);
+  // Recompute the rate over a short recent window, so it reacts to speed changes
+  // instead of just averaging the whole transfer.
+  let lastT = t0, lastN = 0;
   try {
     const { bytes, crc32 } = await client.sendStream(makeSource(), {
       name,
       chunkSize: Math.max(1, Math.min(500, +$('chunk').value || 128)),
       withResponse: !$('noresp').checked,
       signal: abort.signal,
-      onProgress: (n) => { $('progress').value = n; },
+      onProgress: (n) => {
+        $('progress').value = n;
+        const now = performance.now();
+        if (now - lastT >= 200) {
+          const rateKiBs = ((n - lastN) / 1024) / ((now - lastT) / 1000);
+          const pct = total ? ((n / total) * 100).toFixed(0) : '?';
+          let eta = '';
+          if (total && rateKiBs > 0) {
+            const remainingSec = (total - n) / 1024 / rateKiBs;
+            eta = ` - ETA ${formatDuration(remainingSec)}`;
+          }
+          status.textContent = `${pct}% - ${formatBytes(n)}${total ? ` / ${formatBytes(total)}` : ''} - ${rateKiBs.toFixed(1)} KiB/s${eta}`;
+          lastT = now;
+          lastN = n;
+        }
+      },
     });
     const s = (performance.now() - t0) / 1000;
+    status.textContent = `done - ${formatBytes(bytes)} in ${s.toFixed(1)}s (${(bytes / 1024 / s).toFixed(1)} KiB/s avg)`;
     log(`done: ${bytes} bytes in ${s.toFixed(1)}s (${(bytes / 1024 / s).toFixed(1)} KiB/s), crc32 ${crc32.toString(16).padStart(8, '0')}`);
   } catch (e) {
+    status.textContent = `failed: ${e.message}`;
     log(`failed: ${e.name === 'AbortError' ? 'cancelled' : e.message}`);
   } finally {
     abort = null;
